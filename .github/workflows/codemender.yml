@@ -1,0 +1,179 @@
+name: CodeMender CI/CD Guardrail
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      finding_match:
+        description: "Text to match against a finding's title (case-insensitive)"
+        required: false
+        default: "SQL Injection"
+
+env:
+  SCAN_PATH: app
+  CM_DL_PROJECT: cmoc-prod
+  CM_DL_LOCATION: us
+  CM_DL_REPO: codemender-cli-production
+  CM_DL_VERSION: stable
+  CM_ASSET_ZIP: cm-linux-amd64.zip
+  CM_PROJECT: ${{ secrets.CM_PROJECT }}
+  PER_VERIFY_TIMEOUT: "900"
+  PER_FIX_TIMEOUT: "900"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  scan-verify-fix:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install app dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Authenticate to Google Cloud
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/gcp-sa.json"
+          printf '%s' "$GCP_SA_KEY" > "$KEY"
+          gcloud auth activate-service-account --key-file="$KEY" --quiet
+          gcloud config set project "$CM_PROJECT" --quiet
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$KEY" >> "$GITHUB_ENV"
+          echo "GOOGLE_CLOUD_PROJECT=$CM_PROJECT" >> "$GITHUB_ENV"
+
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cmbin"
+          gcloud artifacts generic download \
+            --project="$CM_DL_PROJECT" --location="$CM_DL_LOCATION" \
+            --repository="$CM_DL_REPO" --package=cm --version="$CM_DL_VERSION" \
+            --name="$CM_ASSET_ZIP" --destination="$RUNNER_TEMP/cmbin"
+          ( cd "$RUNNER_TEMP/cmbin" && unzip -oq "$CM_ASSET_ZIP" && chmod +x cm )
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+
+      - name: Initialize CodeMender workspace (cm init)
+        run: cm init -y 2>/dev/null || cm init 2>/dev/null || true
+
+      - name: Run CodeMender scan (cm find)
+        run: cm find "$SCAN_PATH" -y 2>&1 | tee "$RUNNER_TEMP/find.log"
+
+      - name: Generate CodeMender report (cm report)
+        if: always()
+        run: |
+          cm report -f json > "$RUNNER_TEMP/cm-report.json" || true
+          cm report -f md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload CodeMender report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: codemender-report
+          path: ${{ runner.temp }}/cm-report.json
+          if-no-files-found: warn
+
+      - name: Select finding to verify
+        id: select
+        env:
+          MATCH: ${{ inputs.finding_match || 'SQL Injection' }}
+        run: |
+          set -uo pipefail
+          LINE="$(grep -i "$MATCH" "$RUNNER_TEMP/find.log" | head -n1 || true)"
+          if [ -z "$LINE" ]; then
+            echo "No finding matched '$MATCH' — nothing to verify."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          FID="$(echo "$LINE" | awk '{print $1}')"
+          echo "Matched finding $FID: $LINE"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "finding_id=$FID" >> "$GITHUB_OUTPUT"
+
+      - name: Verify CodeMender finding (cm verify)
+        id: verify
+        if: steps.select.outputs.found == 'true'
+        run: |
+          set -uo pipefail
+          FID="${{ steps.select.outputs.finding_id }}"
+          cm session list 2>/dev/null | awk '/RUNNING/{print $1}' | while read -r s; do [ -n "$s" ] && cm session cancel "$s" >/dev/null 2>&1 || true; done || true
+          ( cd "$SCAN_PATH" && timeout "$PER_VERIFY_TIMEOUT" cm verify "$FID" -y --unrestricted --bypass-warning ) \
+            2>&1 | tee "$RUNNER_TEMP/verify.log"
+          if grep -q "DISMISSED" "$RUNNER_TEMP/verify.log"; then
+            echo "dismissed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dismissed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fix CodeMender finding (cm fix)
+        id: fix
+        if: steps.verify.outputs.dismissed == 'false'
+        run: |
+          set -uo pipefail
+          FID="${{ steps.select.outputs.finding_id }}"
+          cm session list 2>/dev/null | awk '/RUNNING/{print $1}' | while read -r s; do [ -n "$s" ] && cm session cancel "$s" >/dev/null 2>&1 || true; done || true
+          ( cd "$SCAN_PATH" && timeout "$PER_FIX_TIMEOUT" cm fix "$FID" -y --unrestricted --bypass-warning ) \
+            2>&1 | tee "$RUNNER_TEMP/fix.log"
+          cm report "$FID" -f md > "$RUNNER_TEMP/cm-fix-report.md" || true
+
+      - name: Open remediation PR
+        id: pr
+        if: steps.fix.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          FID="${{ steps.select.outputs.finding_id }}"
+          git add -u
+          if git diff --cached --quiet; then
+            echo "No code changes — nothing to open a PR for."
+            exit 0
+          fi
+          BRANCH="codemender/fix-${GITHUB_RUN_ID}"
+          git config user.name  "codemender[bot]"
+          git config user.email "codemender-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -qm "security: CodeMender fix for $FID"
+          git push -u origin "$BRANCH"
+          {
+            echo "CodeMender verified finding \`$FID\` was exploitable, then generated and build-tested this fix."
+            echo ""
+            echo "Merging clears the security gate for this finding. Review the diff under **Files changed** before merging — pre-GA CodeMender should be closely supervised."
+            echo ""
+            echo "<details><summary>Finding details</summary>"
+            echo ""
+            cat "$RUNNER_TEMP/cm-fix-report.md" 2>/dev/null || true
+            echo ""
+            echo "</details>"
+          } > "$RUNNER_TEMP/pr-body.md"
+          gh pr create --base "$TARGET_BRANCH" --head "$BRANCH" \
+            --title "security: CodeMender fix ($FID)" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
+
+      - name: Security gate
+        if: always()
+        run: |
+          if [ "${{ steps.select.outputs.found }}" = "false" ]; then
+            echo "Target finding no longer present — already resolved. ✅"
+          elif [ "${{ steps.verify.outputs.dismissed }}" = "true" ]; then
+            echo "Finding dismissed by verify — false positive."
+          else
+            echo "::error::Finding not dismissed by verify — still blocking."
+            exit 1
+          fi
