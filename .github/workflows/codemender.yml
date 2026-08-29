@@ -26,7 +26,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  scan-verify-fix:
+  codemender:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-22.04
     timeout-minutes: 30
