@@ -1,0 +1,50 @@
+name: Semgrep Scan
+
+on:
+  workflow_dispatch:
+
+env:
+  SCAN_PATH: app
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Semgrep
+        run: pip install semgrep==1.175.0
+
+      - name: Run Semgrep scan (static analysis)
+        run: semgrep scan --config auto "$SCAN_PATH" 2>&1 | tee "$RUNNER_TEMP/semgrep.log" || true
+
+      - name: Generate Semgrep report
+        if: always()
+        run: |
+          semgrep scan --config auto --json --output "$RUNNER_TEMP/semgrep-report.json" "$SCAN_PATH" || true
+          COUNT="$(jq '.results | length' "$RUNNER_TEMP/semgrep-report.json")"
+          {
+            echo "## Semgrep (static analysis) — $COUNT findings"
+            echo ""
+            echo "| Rule | File:Line | Severity | Message |"
+            echo "|---|---|---|---|"
+            jq -r '.results[] | "| \(.check_id) | \(.path):\(.start.line) | \(.extra.severity) | \(.extra.message | gsub("\\|"; "\\|") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end) |"' "$RUNNER_TEMP/semgrep-report.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Semgrep report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: semgrep-report
+          path: ${{ runner.temp }}/semgrep-report.json
+          if-no-files-found: warn
