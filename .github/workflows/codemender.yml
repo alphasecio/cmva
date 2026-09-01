@@ -46,6 +46,45 @@ jobs:
       - name: Install app dependencies
         run: pip install -r app/requirements.txt
 
+      - name: Install Semgrep OSS
+        run: pip install semgrep==1.175.0
+ 
+      - name: Run Semgrep scan (static analysis)
+        run: semgrep scan --config auto "$SCAN_PATH" 2>&1 | tee "$RUNNER_TEMP/semgrep.log" || true
+ 
+      - name: Generate Semgrep report
+        if: always()
+        run: |
+          semgrep scan --config auto --json --output "$RUNNER_TEMP/semgrep-report.json" "$SCAN_PATH" || true
+          COUNT="$(jq '.results | length' "$RUNNER_TEMP/semgrep-report.json")"
+          {
+            echo "# 🔎 Semgrep Static Analysis Report"
+            echo ""
+            echo "*Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*"
+            echo ""
+            echo "## Summary"
+            echo ""
+            echo "**Total findings: $COUNT**"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|----------|-------|"
+            jq -r '.results | group_by(.extra.severity) | map({severity: .[0].extra.severity, count: length}) | sort_by(-.count) | .[] | "| \(.severity) | \(.count) |"' "$RUNNER_TEMP/semgrep-report.json"
+            echo ""
+            echo "## Findings"
+            echo ""
+            echo "| Rule | Severity | File:Line | Message |"
+            echo "|------|----------|-----------|---------|"
+            jq -r '.results[] | "| `\(.check_id)` | \(.extra.severity) | `\(.path):\(.start.line)` | \(.extra.message | gsub("\\|"; "\\|") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end) |"' "$RUNNER_TEMP/semgrep-report.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+ 
+      - name: Upload Semgrep report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: semgrep-report
+          path: ${{ runner.temp }}/semgrep-report.json
+          if-no-files-found: warn
+ 
       - name: Authenticate to Google Cloud
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
