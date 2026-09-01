@@ -34,11 +34,23 @@ jobs:
           semgrep scan --config auto --json --output "$RUNNER_TEMP/semgrep-report.json" "$SCAN_PATH" || true
           COUNT="$(jq '.results | length' "$RUNNER_TEMP/semgrep-report.json")"
           {
-            echo "## Semgrep (static analysis) — $COUNT findings"
+            echo "# 🔎 Semgrep Static Analysis Report"
             echo ""
-            echo "| Rule | File:Line | Severity | Message |"
-            echo "|---|---|---|---|"
-            jq -r '.results[] | "| \(.check_id) | \(.path):\(.start.line) | \(.extra.severity) | \(.extra.message | gsub("\\|"; "\\|") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end) |"' "$RUNNER_TEMP/semgrep-report.json"
+            echo "*Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*"
+            echo ""
+            echo "## Summary"
+            echo ""
+            echo "**Total findings: $COUNT**"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|----------|-------|"
+            jq -r '.results | group_by(.extra.severity) | map({severity: .[0].extra.severity, count: length}) | sort_by(-.count) | .[] | "| \(.severity) | \(.count) |"' "$RUNNER_TEMP/semgrep-report.json"
+            echo ""
+            echo "## Findings"
+            echo ""
+            echo "| Rule | Severity | File:Line | Message |"
+            echo "|------|----------|-----------|---------|"
+            jq -r '.results[] | "| `\(.check_id)` | \(.extra.severity) | `\(.path):\(.start.line)` | \(.extra.message | gsub("\\|"; "\\|") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end) |"' "$RUNNER_TEMP/semgrep-report.json"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Semgrep report
