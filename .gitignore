@@ -8,3 +8,4 @@ uploads/
 .env
 .DS_Store
 gha-creds-*.json
+.exploit

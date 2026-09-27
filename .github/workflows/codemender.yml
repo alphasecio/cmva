@@ -17,13 +17,14 @@ env:
   CM_DL_REPO: codemender-cli-production
   CM_DL_VERSION: stable
   CM_ASSET_ZIP: cm-linux-amd64.zip
-  CM_PROJECT: ${{ secrets.CM_PROJECT }}
   PER_VERIFY_TIMEOUT: "900"
   PER_FIX_TIMEOUT: "900"
 
 permissions:
   contents: write
   pull-requests: write
+  security-events: write
+  id-token: write
 
 jobs:
   codemender:
@@ -38,6 +39,10 @@ jobs:
         with:
           ref: ${{ env.TARGET_BRANCH }}
 
+      - name: Resolve scan commit
+        id: scan_ref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -47,15 +52,14 @@ jobs:
         run: pip install -r app/requirements.txt
 
       - name: Install Semgrep OSS
-        run: pip install semgrep==1.175.0
+        run: pip install semgrep==1.177.0
  
       - name: Run Semgrep scan (static analysis)
-        run: semgrep scan --config auto "$SCAN_PATH" 2>&1 | tee "$RUNNER_TEMP/semgrep.log" || true
- 
-      - name: Generate Semgrep report
+        run: semgrep scan --config auto --json-output="$RUNNER_TEMP/semgrep-report.json" --sarif-output="$RUNNER_TEMP/semgrep.sarif" "$SCAN_PATH" || true
+        
+      - name: Publish Semgrep summary
         if: always()
         run: |
-          semgrep scan --config auto --json --output "$RUNNER_TEMP/semgrep-report.json" "$SCAN_PATH" || true
           COUNT="$(jq '.results | length' "$RUNNER_TEMP/semgrep-report.json")"
           {
             echo "# 🔎 Semgrep Static Analysis Report"
@@ -76,26 +80,30 @@ jobs:
             echo "|------|----------|-----------|---------|"
             jq -r '.results[] | "| `\(.check_id)` | \(.extra.severity) | `\(.path):\(.start.line)` | \(.extra.message | gsub("\\|"; "\\|") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end) |"' "$RUNNER_TEMP/semgrep-report.json"
           } >> "$GITHUB_STEP_SUMMARY"
- 
-      - name: Upload Semgrep report
+
+      - name: Upload Semgrep JSON report
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: semgrep-report
           path: ${{ runner.temp }}/semgrep-report.json
           if-no-files-found: warn
+
+      - name: Upload Semgrep SARIF report
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ runner.temp }}/semgrep.sarif
+          category: semgrep
+          ref: refs/heads/${{ env.TARGET_BRANCH }}
+          sha: ${{ steps.scan_ref.outputs.sha }}
  
       - name: Authenticate to Google Cloud
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        run: |
-          set -euo pipefail
-          KEY="$RUNNER_TEMP/gcp-sa.json"
-          printf '%s' "$GCP_SA_KEY" > "$KEY"
-          gcloud auth activate-service-account --key-file="$KEY" --quiet
-          gcloud config set project "$CM_PROJECT" --quiet
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$KEY" >> "$GITHUB_ENV"
-          echo "GOOGLE_CLOUD_PROJECT=$CM_PROJECT" >> "$GITHUB_ENV"
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
 
       - name: Install CodeMender CLI (cm)
         run: |
@@ -114,19 +122,58 @@ jobs:
       - name: Run CodeMender scan (cm find)
         run: cm find "$SCAN_PATH" -y 2>&1 | tee "$RUNNER_TEMP/find.log"
 
-      - name: Generate CodeMender report (cm report)
+      - name: Generate CodeMender reports (cm report)
         if: always()
         run: |
-          cm report -f json > "$RUNNER_TEMP/cm-report.json" || true
+          cm report -f json > "$RUNNER_TEMP/codemender-report.json" || true
+          cm report -f sarif > "$RUNNER_TEMP/codemender.sarif" || true
           cm report -f md >> "$GITHUB_STEP_SUMMARY" || true
 
-      - name: Upload CodeMender report
+      - name: Clean up CodeMender SARIF
         if: always()
+        run: |
+          jq --slurpfile rep "$RUNNER_TEMP/codemender-report.json" '
+            ($rep[0] | map({key: ((.file_path | ltrimstr($ENV.GITHUB_WORKSPACE + "/")) + ":" + (.start_line | tostring)), value: .}) | from_entries) as $idx
+            | {"CRITICAL": "9.5", "HIGH": "8.0", "MEDIUM": "5.5", "LOW": "3.0"} as $score
+            | .runs[0].results |= (map(
+                .locations[0].physicalLocation as $loc
+                | ($loc.artifactLocation.uri + ":" + ($loc.region.startLine | tostring)) as $key
+                | $idx[$key] as $f
+                | (if $f then $f.title else (.message.text | split("\n")[0] | sub(":[^:]*Source:.*$"; "")) end) as $title
+                | (.ruleId | split(":")[0]) as $cwe
+                | .ruleId = ($cwe + "/" + ($title | ascii_downcase | gsub("[^a-z0-9]+"; "-") | ltrimstr("-") | rtrimstr("-")))
+                | .message.text = (if $f then $f.analysis else .message.text end)
+                | .properties = {title: $title, severity: ($f.severity // "MEDIUM"), key: $key}
+              ) | unique_by(.properties.key))
+            | .runs[0].tool.driver.rules = ([.runs[0].results[] | {
+                id: .ruleId,
+                name: .properties.title,
+                shortDescription: {text: .properties.title},
+                helpUri: ("https://cwe.mitre.org/data/definitions/" + (.ruleId | split("/")[0] | ltrimstr("CWE-")) + ".html"),
+                properties: {tags: ["security", (.ruleId | split("/")[0])], "security-severity": ($score[.properties.severity] // "5.5")}
+              }] | unique_by(.id))
+            | .runs[0].results |= map(del(.properties))
+          ' "$RUNNER_TEMP/codemender.sarif" > "$RUNNER_TEMP/codemender.clean.sarif" \
+            && mv "$RUNNER_TEMP/codemender.clean.sarif" "$RUNNER_TEMP/codemender.sarif" || true
+      
+      - name: Upload CodeMender JSON report
+        if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: codemender-report
-          path: ${{ runner.temp }}/cm-report.json
+          path: ${{ runner.temp }}/codemender-report.json
           if-no-files-found: warn
+
+      - name: Upload CodeMender SARIF report
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ runner.temp }}/codemender.sarif
+          category: codemender
+          ref: refs/heads/${{ env.TARGET_BRANCH }}
+          sha: ${{ steps.scan_ref.outputs.sha }}
 
       - name: Select finding to verify
         id: select
