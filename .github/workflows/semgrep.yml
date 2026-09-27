@@ -8,30 +8,30 @@ env:
 
 permissions:
   contents: read
+  security-events: write
 
 jobs:
-  scan:
+  semgrep:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-
+      
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
-      - name: Install Semgrep
-        run: pip install semgrep==1.175.0
+      - name: Install Semgrep OSS
+        run: pip install semgrep==1.177.0
 
       - name: Run Semgrep scan (static analysis)
-        run: semgrep scan --config auto "$SCAN_PATH" 2>&1 | tee "$RUNNER_TEMP/semgrep.log" || true
-
-      - name: Generate Semgrep report
+        run: semgrep scan --config auto --json-output="$RUNNER_TEMP/semgrep-report.json" --sarif-output="$RUNNER_TEMP/semgrep.sarif" "$SCAN_PATH" || true
+        
+      - name: Publish Semgrep summary
         if: always()
         run: |
-          semgrep scan --config auto --json --output "$RUNNER_TEMP/semgrep-report.json" "$SCAN_PATH" || true
           COUNT="$(jq '.results | length' "$RUNNER_TEMP/semgrep-report.json")"
           {
             echo "# 🔎 Semgrep Static Analysis Report"
@@ -53,10 +53,17 @@ jobs:
             jq -r '.results[] | "| `\(.check_id)` | \(.extra.severity) | `\(.path):\(.start.line)` | \(.extra.message | gsub("\\|"; "\\|") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end) |"' "$RUNNER_TEMP/semgrep-report.json"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload Semgrep report
+      - name: Upload Semgrep JSON report
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: semgrep-report
           path: ${{ runner.temp }}/semgrep-report.json
           if-no-files-found: warn
+
+      - name: Upload Semgrep SARIF report
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ runner.temp }}/semgrep.sarif
+          category: semgrep
