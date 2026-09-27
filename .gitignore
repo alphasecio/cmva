@@ -7,3 +7,4 @@ uploads/
 *.log
 .env
 .DS_Store
+gha-creds-*.json
